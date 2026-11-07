@@ -1,0 +1,208 @@
+name: Build and deploy
+
+# Build the image → push to ECR → deploy to EC2 through SSM Run Command → smoke test via the ALB.
+#
+# AWS credentials (provide ONE of these; see README "CI/CD"):
+#   A) OIDC, no stored keys: set variable AWS_ROLE_ARN (or pass it as a run input)
+#   B) Access keys:          set secrets AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+#                            (+ AWS_SESSION_TOKEN for temporary creds)
+#   C) Keys + role:          B plus AWS_ROLE_ARN → the keys are used to assume the role
+#
+# Optional repository variables: AWS_REGION (default us-east-1), PROJECT_NAME (default flask-info).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - app.py
+      - Dockerfile
+      - requirements.txt
+      - .github/workflows/deploy.yml
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region (overrides the AWS_REGION variable)"
+        required: false
+      aws_role_arn:
+        description: "IAM role ARN to assume (overrides the AWS_ROLE_ARN variable)"
+        required: false
+      project_name:
+        description: "Terraform project_name (overrides the PROJECT_NAME variable)"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write # needed only for OIDC; harmless otherwise
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ inputs.aws_region || vars.AWS_REGION || 'us-east-1' }}
+  AWS_ROLE_ARN: ${{ inputs.aws_role_arn || vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+  PROJECT_NAME: ${{ inputs.project_name || vars.PROJECT_NAME || 'flask-info' }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that credentials were supplied
+        env:
+          HAS_KEYS: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' }}
+        run: |
+          if [ "$HAS_KEYS" != "true" ] && [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::No AWS credentials. Set the AWS_ROLE_ARN variable (OIDC) or the AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY secrets."
+            exit 1
+          fi
+          if [ "$HAS_KEYS" = "true" ]; then echo "Using access keys${AWS_ROLE_ARN:+ to assume $AWS_ROLE_ARN}"; else echo "Using OIDC to assume $AWS_ROLE_ARN"; fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          role-session-name: gha-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Discover deployment targets
+        id: targets
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity --query Arn --output text
+
+          repo_uri=$(aws ecr describe-repositories --repository-names "$PROJECT_NAME" \
+            --query 'repositories[0].repositoryUri' --output text)
+
+          instance_ids=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=$PROJECT_NAME" \
+                      "Name=tag:ManagedBy,Values=terraform" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          if [ -z "$instance_ids" ]; then
+            echo "::error::No running instances tagged Project=$PROJECT_NAME in $AWS_REGION. Has 'terraform apply' run?"
+            exit 1
+          fi
+
+          echo "repo_uri=$repo_uri"         >> "$GITHUB_OUTPUT"
+          echo "registry=${repo_uri%%/*}"   >> "$GITHUB_OUTPUT"
+          echo "instance_ids=$instance_ids" >> "$GITHUB_OUTPUT"
+          echo "Repository: $repo_uri"
+          echo "Instances:  $instance_ids"
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.targets.outputs.repo_uri }}:${{ env.IMAGE_TAG }}
+            ${{ steps.targets.outputs.repo_uri }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Wait for instances to be online in SSM
+        env:
+          INSTANCE_IDS: ${{ steps.targets.outputs.instance_ids }}
+        run: |
+          set -euo pipefail
+          for id in $INSTANCE_IDS; do
+            for i in $(seq 1 60); do
+              status=$(aws ssm describe-instance-information \
+                --filters "Key=InstanceIds,Values=$id" \
+                --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)
+              [ "$status" = "Online" ] && { echo "$id is Online"; break; }
+              [ "$i" = 60 ] && { echo "::error::$id never came Online in SSM (is enable_ssm=true?)"; exit 1; }
+              echo "Waiting for $id (status: ${status:-unknown})..."; sleep 5
+            done
+          done
+
+      - name: Deploy via SSM Run Command
+        env:
+          INSTANCE_IDS: ${{ steps.targets.outputs.instance_ids }}
+          IMAGE: ${{ steps.targets.outputs.repo_uri }}:${{ env.IMAGE_TAG }}
+          REGISTRY: ${{ steps.targets.outputs.registry }}
+        run: |
+          set -euo pipefail
+
+          # Runs as root on the instance. Pull first so a bad push fails loudly
+          # before anything changes. Then pin the new immutable tag and restart.
+          cat > deploy.sh <<EOF
+          set -euo pipefail
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
+          docker pull $IMAGE
+          sed -i 's|^IMAGE=.*|IMAGE=$IMAGE|' /etc/app.env
+          systemctl restart app
+          . /etc/app.env
+          for i in \$(seq 1 30); do
+            if curl -fsS "http://localhost:\$APP_PORT/info"; then echo; echo "Deployed $IMAGE"; exit 0; fi
+            sleep 2
+          done
+          journalctl -u app --no-pager -n 50
+          exit 1
+          EOF
+
+          jq -n --rawfile s deploy.sh '{commands: ($s | split("\n") | map(select(length > 0)))}' > params.json
+
+          command_id=$(aws ssm send-command \
+            --instance-ids $INSTANCE_IDS \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${IMAGE_TAG:0:12} (run ${GITHUB_RUN_ID})" \
+            --timeout-seconds 600 \
+            --parameters file://params.json \
+            --query Command.CommandId --output text)
+          echo "SSM command: $command_id"
+
+          failed=0
+          for id in $INSTANCE_IDS; do
+            for i in $(seq 1 120); do
+              status=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$id" \
+                --query Status --output text 2>/dev/null || echo Pending)
+              case "$status" in Pending|InProgress|Delayed) sleep 5 ;; *) break ;; esac
+            done
+            echo "::group::$id → $status"
+            aws ssm get-command-invocation --command-id "$command_id" --instance-id "$id" \
+              --query '[StandardOutputContent, StandardErrorContent]' --output text || true
+            echo "::endgroup::"
+            [ "$status" = "Success" ] || { echo "::error::Deploy failed on $id ($status)"; failed=1; }
+          done
+          exit $failed
+
+      - name: Smoke test through the ALB
+        env:
+          INSTANCE_IDS: ${{ steps.targets.outputs.instance_ids }}
+        run: |
+          set -euo pipefail
+          alb_dns=$(aws elbv2 describe-load-balancers --names "$PROJECT_NAME-alb" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          tg_arn=$(aws elbv2 describe-target-groups --names "$PROJECT_NAME-tg" \
+            --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+          targets=$(for id in $INSTANCE_IDS; do printf 'Id=%s ' "$id"; done)
+          aws elbv2 wait target-in-service --target-group-arn "$tg_arn" --targets $targets
+
+          url="http://$alb_dns/info"
+          for i in $(seq 1 20); do
+            if body=$(curl -fsS --max-time 5 "$url"); then
+              echo "$body" | jq .
+              echo "### Deployed \`${IMAGE_TAG:0:12}\` → $url" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::$url did not return 200"
+          exit 1

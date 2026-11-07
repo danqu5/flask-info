@@ -1,0 +1,90 @@
+#!/bin/bash
+# First-boot bootstrap for Ubuntu 24.04 (rendered by Terraform). After this
+# runs once, systemd brings Docker and the app container back on every reboot.
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+# unattended-upgrades often holds the dpkg lock right after boot; wait for it.
+APT="apt-get -y -o DPkg::Lock::Timeout=600"
+
+$APT update
+# docker.io: Ubuntu's Docker Engine package.
+# amazon-ecr-credential-helper: lets Docker authenticate to ECR with the
+# instance role on its own (Ubuntu doesn't ship the AWS CLI).
+$APT install --no-install-recommends docker.io amazon-ecr-credential-helper ca-certificates curl
+systemctl enable --now docker
+
+# The SSM agent ships as a snap on Canonical's AMIs. Make sure it runs (used by CI/CD deploys).
+snap start --enable amazon-ssm-agent.amazon-ssm-agent || true
+
+# --- App source, used only if the image isn't in ECR yet --------------------
+mkdir -p /opt/app
+echo '${app_py}'       | base64 -d > /opt/app/app.py
+echo '${dockerfile}'   | base64 -d > /opt/app/Dockerfile
+echo '${requirements}' | base64 -d > /opt/app/requirements.txt
+
+# --- Docker client config: use the ECR helper for our registry --------------
+mkdir -p /root/.docker
+cat > /root/.docker/config.json <<'EOF'
+{ "credHelpers": { "${registry}": "ecr-login" } }
+EOF
+
+# --- Runtime config ---------------------------------------------------------
+# DOCKER_CONFIG is explicit because systemd units and SSM commands don't always set HOME.
+cat > /etc/app.env <<'EOF'
+IMAGE=${image}
+APP_PORT=${app_port}
+DOCKER_CONFIG=/root/.docker
+EOF
+
+# --- Pull the image from ECR; build it locally if ECR has nothing yet -------
+cat > /usr/local/bin/app-fetch-image <<'EOF'
+#!/bin/bash
+set -u
+set -a; . /etc/app.env; set +a
+if docker pull "$IMAGE"; then
+  echo "Pulled $IMAGE from ECR"
+  exit 0
+fi
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "ECR pull failed; using cached local $IMAGE"
+  exit 0
+fi
+# Only the first-boot image may be built locally. A pinned release tag from
+# CI/CD must come from ECR, so an old copy of the source is never run under a new tag.
+if [ "$IMAGE" != "${image}" ]; then
+  echo "Cannot pull $IMAGE and it is not cached locally" >&2
+  exit 1
+fi
+echo "No image in ECR yet; building $IMAGE from /opt/app"
+docker build -t "$IMAGE" /opt/app
+EOF
+chmod 0755 /usr/local/bin/app-fetch-image
+
+# --- systemd unit: starts on boot, restarts on failure ----------------------
+# A deploy is: push a new image to ECR, then `systemctl restart app`.
+cat > /etc/systemd/system/app.service <<'EOF'
+[Unit]
+Description=Flask /info app container
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/app.env
+TimeoutStartSec=600
+Restart=always
+RestartSec=5
+ExecStartPre=/usr/local/bin/app-fetch-image
+ExecStartPre=-/usr/bin/docker rm -f app
+# systemd only expands $VAR as a whole word; inside a word it needs $${VAR}.
+# ($$ is Terraform's escape for a literal $.)
+ExecStart=/usr/bin/docker run --rm --name app -p $${APP_PORT}:5000 $${IMAGE}
+ExecStop=/usr/bin/docker stop app
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now app.service
