@@ -19,7 +19,7 @@
       "Resource": [
         "arn:aws:iam::*:role/flask-info-*",
         "arn:aws:iam::*:instance-profile/flask-info-*",
-        "arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com"
+        "arn:aws:iam::*:user/flask-info-*"
       ]
     },
     {
@@ -28,7 +28,9 @@
       "Action": "iam:CreateServiceLinkedRole",
       "Resource": "*",
       "Condition": {
-        "StringEquals": { "iam:AWSServiceName": "elasticloadbalancing.amazonaws.com" }
+        "StringEquals": {
+          "iam:AWSServiceName": "elasticloadbalancing.amazonaws.com"
+        }
       }
     }
   ]

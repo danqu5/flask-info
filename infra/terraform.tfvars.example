@@ -1,14 +1,6 @@
 # Copy to terraform.tfvars and adjust. Every value is optional.
 
-aws_region       = "us-east-1"
-# aws_profile    = "my-profile"                       # or use env vars / AWS_PROFILE
-# assume_role_arn = "arn:aws:iam::123456789012:role/Deployer"
-
-ssh_allowed_cidr = "1.2.3.4/32"                       # replace with your IP/32
+aws_region       = "us-east-2"
+ssh_allowed_cidr = "1.2.3.4/32"                     # replace with your IP/32
 # ssh_public_key = "ssh-ed25519 AAAA... you@laptop"
-
 # instance_type  = "t3.micro"
-
-# CI/CD: create an OIDC role GitHub Actions can assume (no stored keys)
-# github_repository           = "your-org/tech-challenge"
-# create_github_oidc_provider = false   # if the account already has GitHub's OIDC provider

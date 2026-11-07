@@ -1,24 +1,12 @@
-# Least-privilege permissions for the GitHub Actions pipeline.
+# IAM user for the GitHub Actions pipeline, with only the permissions a deploy
+# needs. Its access key goes into the repo's AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY secrets (see the ci_* outputs).
 #
-# The policy document is always rendered and exported as an output, so
-# a tester using static access keys can attach the same permissions to
-# their own IAM user. When var.github_repository is set, an OIDC-trusted
-# role is also created so the workflow can run without long-lived keys.
+# Note: the secret key is stored in Terraform state in plaintext. Keep state
+# private (it is gitignored here); use an encrypted remote backend on a team.
 
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
-
-locals {
-  github_oidc_enabled = var.github_repository != ""
-  github_subjects = length(var.github_oidc_subjects) > 0 ? var.github_oidc_subjects : [
-    "repo:${var.github_repository}:ref:refs/heads/main",
-  ]
-  oidc_provider_arn = (
-    local.github_oidc_enabled && var.create_github_oidc_provider
-    ? aws_iam_openid_connect_provider.github[0].arn
-    : "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
-  )
-}
 
 data "aws_iam_policy_document" "deployer" {
   statement {
@@ -83,53 +71,33 @@ data "aws_iam_policy_document" "deployer" {
   }
 }
 
-# --- Optional: GitHub OIDC role ---------------------------------------------
-
-resource "aws_iam_openid_connect_provider" "github" {
-  count          = local.github_oidc_enabled && var.create_github_oidc_provider ? 1 : 0
-  url            = "https://token.actions.githubusercontent.com"
-  client_id_list = ["sts.amazonaws.com"]
-  # AWS no longer checks these for GitHub, but older providers require a value.
-  thumbprint_list = [
-    "6938fd4d98bab03faadb97b34396831e3780aea1",
-    "1c58a3a8518e8759bf075b76b750d4f2df264fcd",
-  ]
+resource "aws_iam_user" "ci" {
+  name = "${var.project_name}-github-ci"
 }
 
-data "aws_iam_policy_document" "github_trust" {
-  count = local.github_oidc_enabled ? 1 : 0
-
-  statement {
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-
-    principals {
-      type        = "Federated"
-      identifiers = [local.oidc_provider_arn]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-
-    condition {
-      test     = "StringLike"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = local.github_subjects
-    }
-  }
-}
-
-resource "aws_iam_role" "github_deployer" {
-  count              = local.github_oidc_enabled ? 1 : 0
-  name               = "${var.project_name}-github-deployer"
-  assume_role_policy = data.aws_iam_policy_document.github_trust[0].json
-}
-
-resource "aws_iam_role_policy" "github_deployer" {
-  count  = local.github_oidc_enabled ? 1 : 0
+resource "aws_iam_user_policy" "ci" {
   name   = "deploy"
-  role   = aws_iam_role.github_deployer[0].id
+  user   = aws_iam_user.ci.name
   policy = data.aws_iam_policy_document.deployer.json
+}
+
+resource "aws_iam_access_key" "ci" {
+  user = aws_iam_user.ci.name
+}
+
+# These resources used to be optional (count = 0/1). The moved blocks keep the
+# existing user and key, so the secrets already in GitHub stay valid.
+moved {
+  from = aws_iam_user.ci[0]
+  to   = aws_iam_user.ci
+}
+
+moved {
+  from = aws_iam_user_policy.ci[0]
+  to   = aws_iam_user_policy.ci
+}
+
+moved {
+  from = aws_iam_access_key.ci[0]
+  to   = aws_iam_access_key.ci
 }

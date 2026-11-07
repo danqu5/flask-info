@@ -2,13 +2,9 @@ name: Build and deploy
 
 # Build the image → push to ECR → deploy to EC2 through SSM Run Command → smoke test via the ALB.
 #
-# AWS credentials (provide ONE of these; see README "CI/CD"):
-#   A) OIDC, no stored keys: set variable AWS_ROLE_ARN (or pass it as a run input)
-#   B) Access keys:          set secrets AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
-#                            (+ AWS_SESSION_TOKEN for temporary creds)
-#   C) Keys + role:          B plus AWS_ROLE_ARN → the keys are used to assume the role
-#
-# Optional repository variables: AWS_REGION (default us-east-1), PROJECT_NAME (default flask-info).
+# AWS credentials: repository secrets AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+# (from `terraform output ci_access_key_id` / `terraform output -raw ci_secret_access_key`).
+# Optional repository variables: AWS_REGION (default us-east-2), PROJECT_NAME (default flask-info).
 
 on:
   push:
@@ -23,24 +19,19 @@ on:
       aws_region:
         description: "AWS region (overrides the AWS_REGION variable)"
         required: false
-      aws_role_arn:
-        description: "IAM role ARN to assume (overrides the AWS_ROLE_ARN variable)"
-        required: false
       project_name:
         description: "Terraform project_name (overrides the PROJECT_NAME variable)"
         required: false
 
 permissions:
   contents: read
-  id-token: write # needed only for OIDC; harmless otherwise
 
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  AWS_REGION: ${{ inputs.aws_region || vars.AWS_REGION || 'us-east-1' }}
-  AWS_ROLE_ARN: ${{ inputs.aws_role_arn || vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+  AWS_REGION: ${{ inputs.aws_region || vars.AWS_REGION || 'us-east-2' }}
   PROJECT_NAME: ${{ inputs.project_name || vars.PROJECT_NAME || 'flask-info' }}
   IMAGE_TAG: ${{ github.sha }}
 
@@ -56,22 +47,17 @@ jobs:
         env:
           HAS_KEYS: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' }}
         run: |
-          if [ "$HAS_KEYS" != "true" ] && [ -z "$AWS_ROLE_ARN" ]; then
-            echo "::error::No AWS credentials. Set the AWS_ROLE_ARN variable (OIDC) or the AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY secrets."
+          if [ "$HAS_KEYS" != "true" ]; then
+            echo "::error::Set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY repository secrets."
             exit 1
           fi
-          if [ "$HAS_KEYS" = "true" ]; then echo "Using access keys${AWS_ROLE_ARN:+ to assume $AWS_ROLE_ARN}"; else echo "Using OIDC to assume $AWS_ROLE_ARN"; fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          role-session-name: gha-${{ github.run_id }}
-          role-duration-seconds: 3600
 
       - name: Discover deployment targets
         id: targets
@@ -93,7 +79,6 @@ jobs:
           fi
 
           echo "repo_uri=$repo_uri"         >> "$GITHUB_OUTPUT"
-          echo "registry=${repo_uri%%/*}"   >> "$GITHUB_OUTPUT"
           echo "instance_ids=$instance_ids" >> "$GITHUB_OUTPUT"
           echo "Repository: $repo_uri"
           echo "Instances:  $instance_ids"
@@ -126,7 +111,7 @@ jobs:
                 --filters "Key=InstanceIds,Values=$id" \
                 --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)
               [ "$status" = "Online" ] && { echo "$id is Online"; break; }
-              [ "$i" = 60 ] && { echo "::error::$id never came Online in SSM (is enable_ssm=true?)"; exit 1; }
+              [ "$i" = 60 ] && { echo "::error::$id never came Online in SSM "; exit 1; }
               echo "Waiting for $id (status: ${status:-unknown})..."; sleep 5
             done
           done
@@ -135,19 +120,18 @@ jobs:
         env:
           INSTANCE_IDS: ${{ steps.targets.outputs.instance_ids }}
           IMAGE: ${{ steps.targets.outputs.repo_uri }}:${{ env.IMAGE_TAG }}
-          REGISTRY: ${{ steps.targets.outputs.registry }}
         run: |
           set -euo pipefail
 
           # Runs as root on the instance. Pull first so a bad push fails loudly
           # before anything changes. Then pin the new immutable tag and restart.
+          # Docker authenticates to ECR through the instance's ecr-login credential helper.
           cat > deploy.sh <<EOF
           set -euo pipefail
-          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
+          set -a; . /etc/app.env; set +a
           docker pull $IMAGE
           sed -i 's|^IMAGE=.*|IMAGE=$IMAGE|' /etc/app.env
           systemctl restart app
-          . /etc/app.env
           for i in \$(seq 1 30); do
             if curl -fsS "http://localhost:\$APP_PORT/info"; then echo; echo "Deployed $IMAGE"; exit 0; fi
             sleep 2
@@ -156,7 +140,10 @@ jobs:
           exit 1
           EOF
 
-          jq -n --rawfile s deploy.sh '{commands: ($s | split("\n") | map(select(length > 0)))}' > params.json
+          # AWS-RunShellScript uses /bin/sh, which is dash on Ubuntu, so pass the
+          # script through base64 and run it with bash explicitly.
+          jq -n --arg b64 "$(base64 -w0 deploy.sh)" \
+            '{commands: ["echo \($b64) | base64 -d | bash"]}' > params.json
 
           command_id=$(aws ssm send-command \
             --instance-ids $INSTANCE_IDS \

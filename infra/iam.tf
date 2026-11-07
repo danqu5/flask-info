@@ -72,7 +72,6 @@ data "aws_iam_policy_document" "ssm_run_command" {
 }
 
 resource "aws_iam_role_policy" "ssm_run_command" {
-  count  = var.enable_ssm ? 1 : 0
   name   = "ssm-run-command"
   role   = aws_iam_role.app.id
   policy = data.aws_iam_policy_document.ssm_run_command.json
@@ -81,4 +80,9 @@ resource "aws_iam_role_policy" "ssm_run_command" {
 resource "aws_iam_instance_profile" "app" {
   name = "${var.project_name}-ec2-profile"
   role = aws_iam_role.app.name
+}
+
+moved {
+  from = aws_iam_role_policy.ssm_run_command[0]
+  to   = aws_iam_role_policy.ssm_run_command
 }
