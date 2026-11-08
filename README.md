@@ -13,6 +13,10 @@ Internet ──:80──▶ ALB (alb-sg) ──:5000──▶ EC2 (app-sg) ─�
                                  SSH :22 ◀── ssh_allowed_cidr only
 ```
 
+> [!IMPORTANT]
+> **Run every `terraform` command, and every command that uses `terraform output`, from the `infra/` directory** (`cd infra`).
+> Terraform's configuration and state live there. Run anywhere else, `terraform output` prints an error and returns **nothing**, so a command like `terraform output -raw ci_access_key_id | gh secret set …` quietly saves an **empty** secret.
+
 ## Security choices
 
 | Requirement | How it's met |
@@ -44,8 +48,12 @@ Both Terraform and the pipeline authenticate with **AWS access keys**. Nothing i
 
   Optional repository **variables**: `AWS_REGION` (default `us-east-2`) and `PROJECT_NAME` (default `flask-info`, must match Terraform's `project_name`).
 
-  Or set them with the [GitHub CLI](https://cli.github.com/) (after `gh auth login`), from `infra/`. The keys go straight from Terraform to GitHub without being shown:
+  Or set them with the [GitHub CLI](https://cli.github.com/) (after `gh auth login`). The keys go straight from Terraform to GitHub without being shown:
+
+  > ⚠️ **Run these from `infra/`.** Anywhere else, the secrets are saved empty and the workflow fails with *"Set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY repository secrets."*
+
   ```bash
+  cd infra
   REPO=owner/repo
   terraform output -raw ci_access_key_id     | gh secret set AWS_ACCESS_KEY_ID     --repo "$REPO"
   terraform output -raw ci_secret_access_key | gh secret set AWS_SECRET_ACCESS_KEY --repo "$REPO"
