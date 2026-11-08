@@ -57,6 +57,31 @@ Both Terraform and the pipeline authenticate with **AWS access keys**. Nothing i
 
 The pipeline user's secret key is stored in Terraform state, which is gitignored. Keep the state file private.
 
+## Region
+
+Everything deploys to **`us-east-2`** by default. To use another region, set it in **both** places, because the pipeline looks for the instance, ECR repository and load balancer in its own region:
+
+- **Terraform:** `-var aws_region=<region>`, or `aws_region = "<region>"` in `infra/terraform.tfvars`
+- **GitHub:** the repository variable `AWS_REGION` (`gh variable set AWS_REGION --repo owner/repo --body <region>`), or the region input on a manual run
+
+If your account belongs to an AWS Organization that only allows certain regions, an "explicit deny in a service control policy" error means you need to pick an allowed region. To see which regions your credentials can use, run this with the same AWS keys Terraform will use:
+
+```bash
+for r in us-east-1 us-east-2 us-west-1 us-west-2 eu-west-1 eu-central-1; do
+  printf '%-14s ' "$r"
+  aws ec2 describe-images --region "$r" --owners 099720109477 --max-items 1 \
+    --query 'Images[0].ImageId' --output text 2>&1 | grep -oE 'ami-[0-9a-f]+|explicit deny|UnauthorizedOperation' | head -1
+done
+```
+
+It looks up the official Ubuntu image (`099720109477` is Canonical's AWS account) in each region:
+
+- `ami-…`: the region is allowed.
+- `explicit deny`: your organization blocks it.
+- `UnauthorizedOperation`: your IAM user lacks EC2 permissions.
+
+Add other regions to the list as needed. A region passing this check is a strong sign it will work, but an organization policy can still block individual services there.
+
 ## Deploy the infrastructure
 
 ```bash
